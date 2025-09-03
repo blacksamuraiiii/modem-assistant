@@ -10,7 +10,7 @@
 - **批量SN配置**: 支持从Excel文件批量读取SN码并自动配置到光猫设备
 - **设备检测**: 在配置前自动ping检测设备连通性
 - **MAC地址验证**: 通过MAC地址检测确保设备更换后才会写入新的SN码
-- **多设备支持**: 目前已配置1G(ZXHN F610GV9)和10G(SK-D841L)两种光猫型号
+- **多设备支持**: 目前已配置1G(ZXHN F610GV9)和10G(SK-D841L/SK-D840L)三种光猫型号
 - **图形界面**: 基于Gooey框架的友好用户界面
 - **断点续传**: 支持从上次中断的位置继续配置
 - **进度追踪**: 实时显示配置进度和剩余时间
@@ -70,18 +70,9 @@ python run.py
 2. 在GUI界面中：
    - 选择包含SN码的Excel文件
    - 设置筛选条件（如装机地址）
-   - 选择光猫类型（1G或10G）
+   - 选择光猫类型（F610GV或SK-D841L/SK-D840L）
    - 点击开始配置
 
-### 测试脚本
-
-```bash
-# 测试1G光猫配置
-python test_F610GV9_1g.py
-
-# 测试10G光猫配置
-python test__10g.py
-```
 
 ### 打包为可执行文件
 
@@ -117,7 +108,7 @@ Excel文件应包含以下列：
 ### 光猫登录信息
 
 - 地址: 192.168.1.1
-- 密码: ***
+- 密码: *** //初始密码
 
 ### 配置路径
 
@@ -155,30 +146,12 @@ Excel文件应包含以下列：
 ```bash
 # 运行测试脚本查看浏览器操作
 python test_F610GV9_1g.py
+python test_SK-D841L_10g.py
 ```
-
-## 贡献指南
-
-1. Fork 本仓库
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 开启Pull Request
-
-## 许可证
-
-本项目采用MIT许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。
-
-## 联系方式
-
-如有问题或建议，请通过以下方式联系：
-
-- 创建Issue
-- 发送邮件
 
 ## 更新日志
 
-### v0.1
+### v1.0
 
 - 初始版本发布
 - 支持1G和10G光猫批量配置
