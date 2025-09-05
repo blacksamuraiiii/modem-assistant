@@ -5,11 +5,13 @@ import pandas as pd
 import os
 import sys
 import logging
+import tempfile
 from datetime import datetime
 from playwright.sync_api import Playwright, sync_playwright
 import customtkinter as ctk
 from tkinter import filedialog, messagebox, ttk, Canvas
 import threading
+from contextlib import contextmanager
 
 # 设置标准输出编码为UTF-8
 if sys.platform == 'win32' and sys.stdout is not None:
@@ -35,8 +37,130 @@ STATUS_COLORS = {
     STATUS_FAILED: 'red'
 }
 
-# 全局变量存储子进程引用
-running_processes = {}  # 存储运行中的子进程 {item_id: process}
+# 配置常量
+DEFAULT_IP = "192.168.1.1"
+DEFAULT_PASSWORD = "***"
+
+
+class DeviceManager:
+    """设备管理器：管理设备状态和MAC地址跟踪"""
+    
+    def __init__(self):
+        self.previous_mac = None
+        self.lock = threading.Lock()
+    
+    def get_previous_mac(self):
+        with self.lock:
+            return self.previous_mac
+    
+    def set_previous_mac(self, mac):
+        with self.lock:
+            self.previous_mac = mac
+
+
+class ProcessExecutor:
+    """进程执行器：统一处理子进程管理"""
+    
+    def __init__(self):
+        self.processes = {}
+        self.lock = threading.Lock()
+    
+    def add_process(self, item_id, process, stop_event):
+        with self.lock:
+            self.processes[item_id] = (process, stop_event)
+    
+    def remove_process(self, item_id):
+        with self.lock:
+            if item_id in self.processes:
+                del self.processes[item_id]
+    
+    def stop_all_processes(self):
+        with self.lock:
+            for item_id, (process, stop_event) in list(self.processes.items()):
+                try:
+                    stop_event.set()
+                    process.terminate()
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                except Exception as e:
+                    logging.error(f"终止进程时出现错误: {e}")
+            self.processes.clear()
+    
+    def stop_process(self, item_id):
+        with self.lock:
+            if item_id in self.processes:
+                process, stop_event = self.processes[item_id]
+                try:
+                    stop_event.set()
+                    process.terminate()
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                except Exception as e:
+                    logging.error(f"终止进程时出现错误: {e}")
+                finally:
+                    self.remove_process(item_id)
+
+
+class ScriptGenerator:
+    """脚本生成器：处理临时脚本生成和清理"""
+    
+    @staticmethod
+    def create_device_script(sn, modem_type, password, default_ip):
+        """创建设备配置脚本"""
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        script_content = f"""import sys
+import os
+sys.path.insert(0, r'{current_dir}')
+from app_ctk import run, sync_playwright
+from datetime import datetime
+with sync_playwright() as playwright:
+    success = run(playwright, {repr(sn)}, {repr(modem_type)}, {repr(password)}, {repr(default_ip)})
+    sys.exit(0 if success else 1)
+"""
+        
+        temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8')
+        temp_file.write(script_content)
+        temp_file.close()
+        return temp_file.name
+    
+    @staticmethod
+    @contextmanager
+    def temporary_script(sn, modem_type, password, default_ip):
+        """临时脚本上下文管理器"""
+        script_path = None
+        try:
+            script_path = ScriptGenerator.create_device_script(sn, modem_type, password, default_ip)
+            yield script_path
+        finally:
+            if script_path and os.path.exists(script_path):
+                try:
+                    os.unlink(script_path)
+                except Exception as e:
+                    logging.error(f"删除临时文件失败: {e}")
+
+
+# 全局实例
+device_manager = DeviceManager()
+process_executor = ProcessExecutor()
+
+
+def error_handler(func):
+    """错误处理装饰器"""
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            logging.error(f"在 {func.__name__} 中发生错误: {str(e)}")
+            # 如果是App类的方法，尝试调用log_message
+            if args and hasattr(args[0], 'log_message'):
+                args[0].log_message(f"错误: {str(e)}")
+            return None
+    return wrapper
 
 
 def ping(host):
@@ -339,8 +463,6 @@ def process_file(file_path, filter_condition, modem_type, default_password, defa
 
 def check_device_ready(current_num, total_count, next_address, default_ip, is_first_device=False, log_callback=None, stop_flag=None):
     """检查设备是否就绪（网络连接和MAC地址验证）"""
-    global previous_mac_address
-
     if not is_first_device:
         if log_callback:
             log_callback(f"[{current_num}/{total_count}] 请切换到下一台设备, 10秒后自动继续...")
@@ -376,17 +498,19 @@ def check_device_ready(current_num, total_count, next_address, default_ip, is_fi
         logging.info(f"[{current_num}/{total_count}] 当前设备MAC地址: {current_mac}")
 
         # 检查是否与上一个设备相同（如果不是第一台设备）
-        if not is_first_device and previous_mac_address and current_mac == previous_mac_address:
-            if log_callback:
-                log_callback(f"[{current_num}/{total_count}] 设备未更换！！！请及时更换设备...")
-            logging.warning(f"[{current_num}/{total_count}] 设备未更换！！！请及时更换设备...")
-            # 检查停止标志
-            if stop_flag and stop_flag.is_set():
-                return None
-            return check_device_ready(current_num, total_count, next_address, default_ip, is_first_device=False, log_callback=log_callback, stop_flag=stop_flag)
+        if not is_first_device:
+            previous_mac = device_manager.get_previous_mac()
+            if previous_mac and current_mac == previous_mac:
+                if log_callback:
+                    log_callback(f"[{current_num}/{total_count}] 设备未更换！！！请及时更换设备...")
+                logging.warning(f"[{current_num}/{total_count}] 设备未更换！！！请及时更换设备...")
+                # 检查停止标志
+                if stop_flag and stop_flag.is_set():
+                    return None
+                return check_device_ready(current_num, total_count, next_address, default_ip, is_first_device=False, log_callback=log_callback, stop_flag=stop_flag)
 
         # 更新MAC地址
-        previous_mac_address = current_mac
+        device_manager.set_previous_mac(current_mac)
         return current_mac
 
     else:
@@ -406,27 +530,18 @@ class App(ctk.CTk):
 
         # 高 DPI 支持设置
         try:
-            # 检测系统 DPI 并设置适当的缩放
             import ctypes
             if sys.platform == "win32":
-                # Windows 系统
-                ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
+                ctypes.windll.shcore.SetProcessDpiAwareness(1)
                 scaling = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100.0
             else:
-                # Linux/Mac 系统，使用默认缩放
                 scaling = 1.0
-
-            # 设置 CustomTkinter 缩放
+            
             ctk.set_widget_scaling(scaling)
-
-            # 设置 Tkinter 缩放
             self.tk.call('tk', 'scaling', scaling)
-
-        except Exception as e:
-            # 如果 DPI 设置失败，使用默认值
+        except Exception:
             ctk.set_widget_scaling(1.0)
             self.tk.call('tk', 'scaling', 1.0)
-            print(f"DPI 设置失败，使用默认缩放: {e}")
 
         # 窗口配置
         self.title("光猫助手")
@@ -488,7 +603,7 @@ class App(ctk.CTk):
 
         self.password_entry = ctk.CTkEntry(self, placeholder_text="默认密码***", width=100)
         self.password_entry.grid(row=2, column=1, padx=(300, 10), pady=5, sticky="w")
-        self.password_entry.insert(0, "***")  # 设置默认密码
+        self.password_entry.insert(0, DEFAULT_PASSWORD)  # 设置默认密码
 
         # 创建设备表格
         self.create_device_table()
@@ -752,6 +867,102 @@ class App(ctk.CTk):
         self.log_message(f"设备 {short_address} 状态不是失败，无法执行重试操作")
 
 
+    def _execute_device(self, short_address, sn, item_id, current_num, total_count, is_first_device=True, stop_event=None):
+        """执行设备配置的核心逻辑"""
+        try:
+            # 检查设备是否就绪
+            current_mac = check_device_ready(current_num, total_count, short_address, DEFAULT_IP, 
+                                          is_first_device=is_first_device, log_callback=self.log_message, stop_flag=stop_event)
+            
+            # 检查是否需要停止
+            if stop_event and stop_event.is_set():
+                self.log_message(f"设备 {short_address} 处理被用户停止")
+                return STATUS_FAILED
+            
+            # 如果设备未就绪，直接返回失败
+            if not current_mac:
+                self.log_message(f"设备 {short_address} 检查失败，无法进行配置")
+                return STATUS_FAILED
+            
+            modem_type = self.modem_combo.get()
+            password = self.password_entry.get().strip()
+            if not password:
+                password = "***"  # 使用默认密码
+
+            # 使用ScriptGenerator创建临时脚本
+            with ScriptGenerator.temporary_script(sn, modem_type, password, DEFAULT_IP) as script_path:
+                # 构造命令参数
+                cmd = [sys.executable, script_path]
+                
+                # 启动子进程
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                
+                # 存储子进程引用和停止事件
+                process_executor.add_process(item_id, process, stop_event)
+                
+                # 实时读取子进程输出
+                while process.poll() is None and (not stop_event or not stop_event.is_set()):
+                    # 非阻塞方式读取输出
+                    output = process.stdout.readline()
+                    if output:
+                        prefix = f"[{current_num}/{total_count}] " if total_count > 1 else ""
+                        self.log_message(f"{prefix}设备 {short_address}: {output.strip()}")
+                    else:
+                        # 短暂休眠以避免CPU占用过高
+                        time.sleep(0.1)
+                
+                # 如果进程还在运行，尝试终止它
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                
+                # 获取剩余输出
+                remaining_stdout, remaining_stderr = process.communicate()
+                
+                # 检查是否需要停止
+                if stop_event and stop_event.is_set():
+                    self.log_message(f"设备 {short_address} 处理被用户停止")
+                    return STATUS_FAILED
+                
+                # 获取子进程返回码
+                return_code = process.returncode
+                
+                # 记录日志
+                prefix = f"[{current_num}/{total_count}] " if total_count > 1 else ""
+                if remaining_stdout:
+                    for line in remaining_stdout.strip().split('\n'):
+                        if line.strip():
+                            self.log_message(f"{prefix}设备 {short_address}: {line.strip()}")
+                if remaining_stderr:
+                    for line in remaining_stderr.strip().split('\n'):
+                        if line.strip():
+                            self.log_message(f"{prefix}设备 {short_address} 错误: {line.strip()}")
+                
+                # 根据返回码确定状态
+                status = STATUS_SUCCESS if return_code == 0 else STATUS_FAILED
+                
+                if status == STATUS_SUCCESS:
+                    self.log_message(f"{prefix}设备 {short_address} 配置成功")
+                else:
+                    self.log_message(f"{prefix}设备 {short_address} 配置失败")
+                
+                # 写入状态日志
+                today = datetime.now().strftime('%Y%m%d')
+                status_log = f"status_{today}.log"
+                write_device_status(status_log, short_address, sn, status, current_mac)
+                
+                return status
+                
+        except Exception as e:
+            self.log_message(f"处理设备 {short_address} 时出现错误: {str(e)}")
+            return STATUS_FAILED
+        finally:
+            # 清理进程引用
+            process_executor.remove_process(item_id)
+
     def run_single_device(self, short_address, sn, item_id):
         """运行单个设备"""
         # 更新状态为运行中
@@ -768,145 +979,22 @@ class App(ctk.CTk):
         # 创建停止事件
         stop_event = threading.Event()
         
-        # 在后台线程中执行所有操作，包括设备检查和配置
+        # 在后台线程中执行设备配置
         def run_device_thread():
             try:
-                # 检查设备是否就绪（作为第一条记录处理）
-                current_mac = check_device_ready(1, 1, short_address, DEFAULT_IP, is_first_device=True, log_callback=self.log_message, stop_flag=stop_event)
+                # 使用统一的设备执行方法
+                status = self._execute_device(short_address, sn, item_id, 1, 1, True, stop_event)
                 
-                # 检查是否需要停止
-                if stop_event.is_set():
-                    self.log_message(f"设备 {short_address} 处理被用户停止")
-                    self.update_device_status(item_id, STATUS_FAILED)
-                    return
+                # 更新状态显示
+                self.update_device_status(item_id, status)
                 
-                # 如果设备未就绪，直接返回失败
-                if not current_mac:
-                    self.log_message(f"设备 {short_address} 检查失败，无法进行配置")
-                    self.update_device_status(item_id, STATUS_FAILED)
-                    return
+                # 记录处理完成日志
+                self.log_message(f"设备 {short_address} 处理完成")
                 
-                modem_type = self.modem_combo.get()
-                password = self.password_entry.get().strip()
-                if not password:
-                    password = "***"  # 使用默认密码
-
-                # 创建子进程执行命令
-                temp_script = None
-                try:
-                    # 创建临时脚本文件
-                    import tempfile
-                    current_dir = os.path.dirname(os.path.abspath(__file__))
-                    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as temp_file:
-                        temp_file.write(f"import sys\n")
-                        temp_file.write(f"import os\n")
-                        temp_file.write(f"sys.path.insert(0, r'{current_dir}')\n")
-                        temp_file.write(f"from app_ctk import run, sync_playwright\n")
-                        temp_file.write(f"from datetime import datetime\n")
-                        temp_file.write(f"with sync_playwright() as playwright:\n")
-                        temp_file.write(f"    success = run(playwright, {repr(sn)}, {repr(modem_type)}, {repr(password)}, {repr(DEFAULT_IP)})\n")
-                        temp_file.write(f"    sys.exit(0 if success else 1)\n")
-                        temp_script = temp_file.name
-                    
-                    # 构造命令参数
-                    cmd = [sys.executable, temp_script]
-                    
-                    # 启动子进程
-                    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                    
-                    # 存储子进程引用和停止事件
-                    running_processes[item_id] = (process, stop_event)
-                    
-                    # 实时读取子进程输出
-                    while process.poll() is None and not stop_event.is_set():
-                        # 非阻塞方式读取输出
-                        output = process.stdout.readline()
-                        if output:
-                            self.log_message(f"设备 {short_address}: {output.strip()}")
-                        else:
-                            # 短暂休眠以避免CPU占用过高
-                            time.sleep(0.1)
-                        
-                        # 检查是否需要停止
-                        if stop_event.is_set():
-                            break
-                    
-                    # 如果进程还在运行，尝试终止它
-                    if process.poll() is None:
-                        process.terminate()
-                        try:
-                            process.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                    
-                    # 获取剩余输出
-                    remaining_stdout, remaining_stderr = process.communicate()
-                    
-                    # 检查是否需要停止
-                    if stop_event.is_set():
-                        self.log_message(f"设备 {short_address} 处理被用户停止")
-                        self.update_device_status(item_id, STATUS_FAILED)
-                        return
-                    
-                    # 获取子进程返回码
-                    return_code = process.returncode
-                    
-                    # 记录日志
-                    if remaining_stdout:
-                        # 按行分割并记录输出
-                        for line in remaining_stdout.strip().split('\n'):
-                            if line.strip():
-                                self.log_message(f"设备 {short_address}: {line.strip()}")
-                    if remaining_stderr:
-                        # 按行分割并记录错误
-                        for line in remaining_stderr.strip().split('\n'):
-                            if line.strip():
-                                self.log_message(f"设备 {short_address} 错误: {line.strip()}")
-                    
-                    # 根据返回码确定状态
-                    status = STATUS_SUCCESS if return_code == 0 else STATUS_FAILED
-                    
-                    if status == STATUS_SUCCESS:
-                        self.log_message(f"设备 {short_address} 配置成功")
-                    else:
-                        self.log_message(f"设备 {short_address} 配置失败")
-                    
-                    # 获取MAC地址
-                    current_mac = get_mac_address(DEFAULT_IP)
-                    
-                    # 写入状态日志
-                    today = datetime.now().strftime('%Y%m%d')
-                    status_log = f"status_{today}.log"
-                    write_device_status(status_log, short_address, sn, status, current_mac)
-                    
-                    # 更新状态显示
-                    self.update_device_status(item_id, status)
-                    
-                    # 记录处理完成日志
-                    self.log_message(f"设备 {short_address} 处理完成")
-                    
-                except Exception as e:
-                    self.log_message(f"处理设备 {short_address} 时出现错误: {str(e)}")
-                    self.update_device_status(item_id, STATUS_FAILED)
-                finally:
-                    # 清理进程引用
-                    if item_id in running_processes:
-                        del running_processes[item_id]
-                    
-                    # 删除临时文件
-                    if temp_script:
-                        try:
-                            os.unlink(temp_script)
-                        except Exception as e:
-                            self.log_message(f"删除临时文件失败: {str(e)}")
-                    
-                    # 恢复按钮状态
-                    self.single_button.configure(state="normal")
-                    self.batch_button.configure(state="normal")
-                    self.stop_button.configure(state="disabled", text="停止")
             except Exception as e:
                 self.log_message(f"启动设备 {short_address} 时出现错误: {str(e)}")
                 self.update_device_status(item_id, STATUS_FAILED)
+            finally:
                 # 恢复按钮状态
                 self.single_button.configure(state="normal")
                 self.batch_button.configure(state="normal")
@@ -955,19 +1043,12 @@ class App(ctk.CTk):
         self.batch_button.configure(state="disabled", text="批量执行中...")
         self.stop_button.configure(state="normal", text="停止")
 
-        modem_type = self.modem_combo.get()
-
         # 创建线程停止事件
         stop_event = threading.Event()
 
         # 在后台线程中运行批量处理
         def batch_process_thread():
             try:
-                # 获取密码
-                password = self.password_entry.get().strip()
-                if not password:
-                    password = "***"  # 使用默认密码
-
                 self.log_message("开始批量处理...")
 
                 # 筛选待运行的设备
@@ -995,110 +1076,10 @@ class App(ctk.CTk):
                     self.log_message(f"[{i}/{len(pending_devices)}] 正在处理: {short_address} | SN: {sn}")
 
                     try:
-                        # 检查设备是否就绪
-                        current_mac = check_device_ready(i, len(pending_devices), short_address, DEFAULT_IP,
-                                                       is_first_device=(i == 1), log_callback=self.log_message, stop_flag=stop_event)
-
-                        if self.stop_batch or stop_event.is_set():
-                            break
-
-                        if current_mac:
-                            # 设备就绪，启动配置
-                            self.log_message(f"[{i}/{len(pending_devices)}] 设备就绪，开始配置...")
-                            
-                            # 创建临时脚本文件
-                            import tempfile
-                            current_dir = os.path.dirname(os.path.abspath(__file__))
-                            temp_script = None
-                            try:
-                                with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as temp_file:
-                                    temp_file.write(f"import sys\n")
-                                    temp_file.write(f"import os\n")
-                                    temp_file.write(f"sys.path.insert(0, r'{current_dir}')\n")
-                                    temp_file.write(f"from app_ctk import run, sync_playwright\n")
-                                    temp_file.write(f"from datetime import datetime\n")
-                                    temp_file.write(f"with sync_playwright() as playwright:\n")
-                                    temp_file.write(f"    success = run(playwright, {repr(sn)}, {repr(modem_type)}, {repr(password)}, {repr(DEFAULT_IP)})\n")
-                                    temp_file.write(f"    sys.exit(0 if success else 1)\n")
-                                    temp_script = temp_file.name
-                                
-                                # 构造命令参数
-                                cmd = [sys.executable, temp_script]
-                                
-                                # 启动子进程
-                                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                                
-                                # 存储子进程引用和停止事件
-                                running_processes[item_id] = (process, stop_event)
-                                
-                                # 实时读取子进程输出
-                                while process.poll() is None and not self.stop_batch and not stop_event.is_set():
-                                    # 非阻塞方式读取输出
-                                    output = process.stdout.readline()
-                                    if output:
-                                        self.log_message(f"[{i}/{len(pending_devices)}] 设备 {short_address}: {output.strip()}")
-                                    else:
-                                        # 短暂休眠以避免CPU占用过高
-                                        time.sleep(0.1)
-                                
-                                # 如果进程还在运行，尝试终止它
-                                if process.poll() is None:
-                                    process.terminate()
-                                    try:
-                                        process.wait(timeout=5)
-                                    except subprocess.TimeoutExpired:
-                                        process.kill()
-                                
-                                # 获取剩余输出
-                                remaining_stdout, remaining_stderr = process.communicate()
-                                
-                                # 获取子进程返回码
-                                return_code = process.returncode
-                                
-                                # 记录日志
-                                if remaining_stdout:
-                                    # 按行分割并记录输出
-                                    for line in remaining_stdout.strip().split('\n'):
-                                        if line.strip():
-                                            self.log_message(f"[{i}/{len(pending_devices)}] 设备 {short_address}: {line.strip()}")
-                                if remaining_stderr:
-                                    # 按行分割并记录错误
-                                    for line in remaining_stderr.strip().split('\n'):
-                                        if line.strip():
-                                            self.log_message(f"[{i}/{len(pending_devices)}] 设备 {short_address} 错误: {line.strip()}")
-                                
-                                # 根据返回码确定状态
-                                status = STATUS_SUCCESS if return_code == 0 else STATUS_FAILED
-                                
-                                if status == STATUS_SUCCESS:
-                                    self.log_message(f"[{i}/{len(pending_devices)}] 设备 {short_address} 配置成功")
-                                else:
-                                    self.log_message(f"[{i}/{len(pending_devices)}] 设备 {short_address} 配置失败")
-
-                                # 写入状态日志
-                                today = datetime.now().strftime('%Y%m%d')
-                                status_log = f"status_{today}.log"
-                                write_device_status(status_log, short_address, sn, status, current_mac)
-                                
-                            finally:
-                                # 清理进程引用
-                                if item_id in running_processes:
-                                    del running_processes[item_id]
-                                
-                                # 删除临时文件
-                                if temp_script:
-                                    try:
-                                        os.unlink(temp_script)
-                                    except Exception as e:
-                                        self.log_message(f"删除临时文件失败: {str(e)}")
-                        else:
-                            # 设备检查失败
-                            status = STATUS_FAILED
-                            today = datetime.now().strftime('%Y%m%d')
-                            status_log = f"status_{today}.log"
-                            write_device_status(status_log, short_address, sn, status)
-                            self.log_message(f"[{i}/{len(pending_devices)}] 设备 {short_address} 检查失败")
-
+                        # 使用统一的设备执行方法
+                        status = self._execute_device(short_address, sn, item_id, i, len(pending_devices), 
+                                                   is_first_device=(i == 1), stop_event=stop_event)
+                        
                         # 更新状态显示
                         self.update_device_status(item_id, status)
 
@@ -1142,34 +1123,13 @@ class App(ctk.CTk):
                 stop_event.set()
             self.running_threads.clear()
             
-        # 终止所有运行中的子进程
-        for item_id, process_data in list(running_processes.items()):
-            try:
-                if isinstance(process_data, tuple):
-                    # 单条执行的情况，进程和停止事件存储在元组中
-                    process, stop_event = process_data
-                    stop_event.set()  # 设置停止事件
-                else:
-                    # 兼容旧代码，直接是进程对象
-                    process = process_data
-                
-                process.terminate()  # 先尝试优雅终止
-                process.wait(timeout=5)  # 等待5秒
-            except subprocess.TimeoutExpired:
-                process.kill()  # 如果5秒内未终止，则强制杀死
-                process.wait()  # 等待进程完全终止
-            except Exception as e:
-                self.log_message(f"终止进程时出现错误: {str(e)}")
-            finally:
-                # 从运行中的进程字典中移除
-                if item_id in running_processes:
-                    del running_processes[item_id]
-                    
-                # 更新设备状态为失败
-                for device in self.devices_data:
-                    if device['id'] == item_id:
-                        self.update_device_status(item_id, STATUS_FAILED)
-                        break
+        # 使用ProcessExecutor终止所有进程
+        process_executor.stop_all_processes()
+        
+        # 更新所有运行中设备的状态为失败
+        for device in self.devices_data:
+            if device['status'] == STATUS_RUNNING:
+                self.update_device_status(device['id'], STATUS_FAILED)
                         
         self.log_message("所有进程已停止")
         
@@ -1245,7 +1205,7 @@ class App(ctk.CTk):
                 # 获取密码
                 password = self.password_entry.get().strip()
                 if not password:
-                    password = "***"  # 使用默认密码
+                    password = DEFAULT_PASSWORD  # 使用默认密码
 
                 self.log_message("开始处理...")
                 self.log_message(f"文件: {self.selected_file_path}")
@@ -1280,13 +1240,6 @@ class App(ctk.CTk):
 
 
 if __name__ == '__main__':
-    # 全局变量定义
-    global previous_mac_address
-    previous_mac_address = None
-
-    # 常量定义
-    DEFAULT_IP = "192.168.1.1"
-
     # 创建并运行应用
     app = App()
     app.mainloop()
