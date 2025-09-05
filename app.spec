@@ -3,11 +3,11 @@
 block_cipher = None
 
 a = Analysis(
-    ['run.py'],
+    ['app_ctk.py'],
     pathex=[],
-    binaries=[],
-    datas=[('C:\\Users\\black_samurai\\AppData\\Local\\ms-playwright\\chromium-1187', 'chromium')],
-    hiddenimports=[],
+    binaries=[('C:\\Users\\black_samurai\\AppData\\Local\\ms-playwright\\chromium-1187', 'chromium')],
+    datas=[('version_info.txt', '.'), ('screenshots', 'screenshots')],
+    hiddenimports=['customtkinter', 'playwright', 'pandas', 'openpyxl', 'tkinter', 'ttk'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

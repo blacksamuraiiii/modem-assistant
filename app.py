@@ -308,6 +308,7 @@ def check_device_ready(current_num, total_count, next_address, default_ip, is_fi
     # 等待网络连接，必须 ping 通才能继续
     while not ping(default_ip):
         logging.info(f"[{current_num}/{total_count}] 等待网络连接...")
+        # 检查停止标志（这里简化处理，实际应用中可能需要传递停止标志参数）
         time.sleep(3)
     
     # 获取当前设备的MAC地址
